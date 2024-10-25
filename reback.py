@@ -7,7 +7,6 @@ import os
 import argparse
 import config
 from utils import supervisor, tools
-from utils.tools import test
 from other_defenses_tool_box import BackdoorDefense
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -118,6 +117,35 @@ def cal_hist(data, bin_num=20):
         print("3")
         return data_count[0][0]
 
+def test_trigger(model, test_loader, mask, trigger, target_label):
+    model.eval()
+    clean_correct = 0
+    tot = 0
+    criterion = nn.CrossEntropyLoss()
+    tot_loss = 0
+
+    with torch.no_grad():
+        for data, target in test_loader:
+
+            data = data.cuda()
+            target = target.cuda()
+            data = ((1 - mask) * data + mask * trigger).float()
+            clean_output = model(data)
+            clean_pred = clean_output.argmax(dim=1)
+            clean_correct += clean_pred.eq(target_label).sum().item()
+
+            tot += len(target)
+            this_batch_size = len(target)
+            tot_loss += criterion(clean_output, target) * this_batch_size
+
+    print('Clean ACC: {}/{} = {:.6f}, Loss: {}'.format(
+        clean_correct, tot,
+        clean_correct / tot, tot_loss / tot
+    ))
+
+    return clean_correct / tot, None
+
+
 def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32,32)):
     S = K
 
@@ -126,6 +154,7 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
         inspection_set, batch_size=256, shuffle=False, **kwargs)
 
     #extract 2*K samples
+
     entropy_indices_dir = os.path.join(supervisor.get_poison_set_dir(args), f"entropy_indices_{K}")
     if os.path.exists(entropy_indices_dir):
         with open(entropy_indices_dir, 'rb') as file:
@@ -134,6 +163,10 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
         Top_indices, Bot_indices = extract_entropy(inspection_loader, model, num_classes, K)
         with open(entropy_indices_dir, 'wb') as file:
             pickle.dump([Top_indices, Bot_indices], file)
+
+
+    # print("extract K...")
+    # Top_indices, Bot_indices = extract_entropy(inspection_loader, model, num_classes, K)
 
     data_suspicious = [[] for _ in range(num_classes)]
     data_benign = [[] for _ in range(num_classes)]
@@ -160,7 +193,7 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
     suspicious_indices.sort()
     poison_indices.sort()
     ss = set(suspicious_indices) & set(poison_indices)
-    print(f"Extraction Accuracy: {len(ss)/K*100}% / {len(ss)} / K:{K}")
+    print(f"Backdoor Sample Extraction Accuracy: {len(ss)/K*100}% / {len(ss)} / K:{K}")
 
     # ---------------determine target label
 
@@ -190,22 +223,32 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
         pi_s = np.sum(choose_sample_Theta_s.cpu().numpy() == cls)
         pi_b = np.sum(choose_sample_Theta_b.cpu().numpy() == cls)
 
-        Upsilon.append(pi_s/pi_b)
-        # print(f"{cls}: {pi_s/pi_b}")
+        if pi_b:
+            Upsilon.append(pi_s/pi_b)
+            print(f"{cls}: {pi_s/pi_b}")
+        else:
+            Upsilon.append(0)
 
         if pi_s/pi_b > 5:
             suspicious_label = cls
             break
 
-    od_class = detect_outliers(np.array(Upsilon), threshold=2.5)
-    od_class = np.where(od_class == 1)[0]
-    if suspicious_label in od_class:
+    if suspicious_label is not None:
         print(f"suspicious_label: {suspicious_label}")
-    elif (not suspicious_label) and od_class!=[]:
-        print("Tune parameter again!")
     else:
         print("Clean dataset!")
         exit(0)
+
+    # od_class = detect_outliers(np.array(Upsilon), threshold=2.5)
+    # od_class = np.where(od_class == 1)[0]
+    # if suspicious_label in od_class:
+    #     print(f"suspicious_label: {suspicious_label}")
+    # elif (not suspicious_label) and od_class!=[]:
+    #     print("Tune parameter again!")
+    # else:
+    #     print("Clean dataset!")
+    #     exit(0)
+
 
     plot_img(data_suspicious_avg[0] * 255, "data_suspicious_avg")
     plot_img(data_benign_avg[0] * 255, "data_benign_avg")
@@ -220,8 +263,8 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
     random_bacdoor_data = data_backdoor[random_suspicious_index]
 
     l1_distance_backdoor = np.zeros(data_shape)
-    for e in range(N):
-        l1_distance_backdoor += (np.abs(random_bacdoor_data[e] - data_suspicious_avg[suspicious_label])==0)
+    for e in range(0, N-1):
+        l1_distance_backdoor += (np.abs(random_bacdoor_data[e] - random_bacdoor_data[e+1])==0)
         # l1_distance_backdoor += (np.abs(random_bacdoor_data[e] - data_suspicious_avg[suspicious_label])<0.01)
     l1_distance_backdoor = l1_distance_backdoor / N
     l1_distance_backdoor = np.mean(l1_distance_backdoor, axis=0)
@@ -231,6 +274,8 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
         # suspicious_label_flag = "wanet"
 
     if suspicious_label_flag=="replace":
+        print("replace")
+
         reversed_mask = detect_outliers(np.abs(l1_distance_backdoor), threshold=2.5)
         reversed_trigger = data_backdoor[0] * reversed_mask
 
@@ -297,7 +342,7 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
     test_set_img_dir = os.path.join(test_set_dir, 'data')
     test_set_label_path = os.path.join(test_set_dir, 'labels')
     data_transform = transforms.Compose([
-            transforms.ToTensor(),])
+        transforms.ToTensor(),])
     test_set = tools.IMG_Dataset(data_dir=test_set_img_dir,
                                  label_path=test_set_label_path, transforms=data_transform)
     test_set_loader = torch.utils.data.DataLoader(
@@ -305,15 +350,15 @@ def main(args, model, inspection_set, num_classes, K=100, N=50, data_shape=(3,32
 
     reversed_mask = torch.tensor(reversed_mask).cuda()
     reversed_trigger = torch.tensor(reversed_trigger).cuda()
-    final_asr, _ = tools.test_trigger(model, test_set_loader, reversed_mask, reversed_trigger, 0)
-    print(f"asr of the reversed trigger:{final_asr}")
-    if final_asr > 50:
-        print("blend attack")
+    final_asr, _ = test_trigger(model, test_set_loader, reversed_mask, reversed_trigger, 0)
+    if final_asr > 0.7:
+        print(f"Success! ASR of the reversed trigger:{final_asr}")
         exit(0)
     else:
-        print("asr error!!!")
+        print("ASR error!!!")
 
     # if suspicious_label_flag=="WaNet":
     # The part of code will be released once the detailed corresponding paper is received!
 
     print()
+    exit(0)
